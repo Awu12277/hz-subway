@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import * as THREE from 'three'
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import cityData from '../json/city.json'
 import { parseCityData, computeBounds } from '../utils/subwayData.js'
 
@@ -26,30 +27,95 @@ let flyEndTarget = null
 let flyProgress = 0
 const FLY_DURATION = 1500 // 飞行时间 ms
 
+// ─── 相机跟随状态 ─────────────────────────────────────────
+let followTarget = null
+
 // ─── 对象池 (避免每帧创建新对象) ───────────────────────────
 const stationObjects = [] // { core, ring, ring2, glow, materials }
 const trainObjects = [] // { mesh, userData }
 const lineObjects = [] // { lineMat1, lineMat2, glowMat }
 
-// ─── 粒子系统 ───────────────────────────────────────────────
-const PARTICLE_COUNT = 300
-let particlePoints = null
-let particlePositions = null
-let particleVelocities = null
-let energyBall = null
-const trainAssembleState = ref('particles')
-const assembleStartTime = ref(null)
-
 // ─── 线路选择 ─────────────────────────────────────────────
 const selectedLine = ref(null) // null = 全选
+const followingTrain = ref(false) // 相机跟随模式
+const showWelcome = ref(true) // 欢迎文字显示状态
 
 function selectLine(lineName) {
   if (selectedLine.value === lineName) {
     selectedLine.value = null // 取消选择，显示全部
+    followingTrain.value = false // 取消跟随
+    orbitCtrl.enabled = true // 恢复轨道控制
+    // 显示所有线路和站点
+    showAllLinesAndStations()
   } else {
     selectedLine.value = lineName
+    // 清除所有站点活跃状态
+    clearAllStationsActive()
+    // 隐藏其他线路和站点
+    hideOtherLinesAndStations(lineName)
+    // 重置小车到始发站
+    resetTrainToStart(lineName)
     // 飞向选中线路的第一个站点
     flyToFirstStation(lineName)
+    // 开始跟随模式（飞行结束后生效）
+    followingTrain.value = true
+  }
+}
+
+// ─── 隐藏其他线路和站点 ───────────────────────────────
+function hideOtherLinesAndStations(selectedLineName) {
+  for (const lineObj of lineObjects) {
+    if (lineObj.lineName !== selectedLineName) {
+      lineObj.line1.visible = false
+      lineObj.line2.visible = false
+      lineObj.glowMesh.visible = false
+    }
+  }
+  for (const stationObj of stationObjects) {
+    if (stationObj.lineName !== selectedLineName) {
+      stationObj.core.visible = false
+      stationObj.ring.visible = false
+      stationObj.ring2.visible = false
+      stationObj.glow.visible = false
+      stationObj.label.visible = false
+    }
+  }
+}
+
+// ─── 显示所有线路和站点 ───────────────────────────────
+function showAllLinesAndStations() {
+  for (const lineObj of lineObjects) {
+    lineObj.line1.visible = true
+    lineObj.line2.visible = true
+    lineObj.glowMesh.visible = true
+  }
+  for (const stationObj of stationObjects) {
+    stationObj.core.visible = true
+    stationObj.ring.visible = true
+    stationObj.ring2.visible = true
+    stationObj.glow.visible = true
+    stationObj.label.visible = true
+  }
+}
+
+// ─── 清除所有站点活跃状态 ───────────────────────────────
+function clearAllStationsActive() {
+  for (const stationObj of stationObjects) {
+    stationObj.isActive = false
+  }
+}
+
+// ─── 重置小车到始发站 ──────────────────────────────────────
+function resetTrainToStart(lineName) {
+  for (const train of trainObjects) {
+    if (train.userData.lineName === lineName) {
+      train.userData.t = 0
+      train.userData.waiting = false
+      train.userData.waitTimer = 0
+      train.visible = true
+    } else {
+      train.visible = false
+    }
   }
 }
 
@@ -95,7 +161,10 @@ function updateFlyCamera(delta) {
   orbitCtrl.target.lerpVectors(flyStartTarget, flyEndTarget, t)
 
   if (flyProgress >= 1) {
-    orbitCtrl.enabled = true
+    // 只有不在跟随模式时才启用轨道控制
+    if (!followingTrain.value) {
+      orbitCtrl.enabled = true
+    }
     flyStartPos = null
     flyEndPos = null
     flyStartTarget = null
@@ -173,18 +242,19 @@ function buildSubwayLines() {
       line1,
       line2,
       glowMesh,
-      curve
+      curve,
+      stations: lineData.stations
     })
 
     // 站点
-    for (const station of lineData.stations) {
-      createStation(station, colorInt, lineData.name)
+    for (let i = 0; i < lineData.stations.length; i++) {
+      createStation(lineData.stations[i], colorInt, lineData.name, i)
     }
   }
 }
 
 // ─── 创建站点 (优化: 复用几何体) ───────────────────────────
-function createStation(station, colorInt, lineName) {
+function createStation(station, colorInt, lineName, stationIndex) {
   const mats = createStationMaterials(colorInt)
   const group = new THREE.Group()
   group.position.set(station.position.x, station.position.y, station.position.z)
@@ -219,7 +289,7 @@ function createStation(station, colorInt, lineName) {
   group.add(label)
 
   scene.add(group)
-  stationObjects.push({ lineName, core, ring, ring2, glow, mats, label })
+  stationObjects.push({ lineName, stationIndex, core, ring, ring2, glow, mats, label, stationName: station.name, isActive: false, flashTime: 0 })
 }
 
 // ─── 创建站点标签 (每个标签独立的 canvas) ───────────────
@@ -230,110 +300,150 @@ function createStationLabel(name, colorInt) {
   canvas.height = 64
   const ctx = canvas.getContext('2d')
 
-  ctx.clearRect(0, 0, 256, 64)
-
   const hexColor = '#' + colorInt.toString(16).padStart(6, '0')
-  ctx.shadowColor = hexColor
-  ctx.shadowBlur = 15
-  ctx.font = 'bold 36px Microsoft YaHei, PingFang SC'
-  ctx.textAlign = 'center'
-  ctx.textBaseline = 'middle'
-  ctx.fillStyle = '#ffffff'
-  ctx.fillText(name, 128, 32)
+
+  function drawLabel(opacity = 0.4, scale = 1) {
+    ctx.clearRect(0, 0, 256, 64)
+    ctx.shadowColor = hexColor
+    ctx.shadowBlur = 10 * opacity
+    ctx.font = `${Math.round(24 * scale)}px Microsoft YaHei, PingFang SC`
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.globalAlpha = opacity
+    ctx.fillStyle = '#ffffff'
+    ctx.fillText(name, 128, 32)
+    ctx.globalAlpha = 1
+  }
+
+  drawLabel(0.4, 1)
 
   const texture = new THREE.CanvasTexture(canvas)
 
   const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false, blending: THREE.AdditiveBlending })
   const sprite = new THREE.Sprite(material)
   sprite.scale.set(120, 30, 1)
+
+  // 保存 canvas、ctx 和 drawLabel 函数以便后续更新
+  sprite.userData.canvas = canvas
+  sprite.userData.ctx = ctx
+  sprite.userData.drawLabel = drawLabel
+  sprite.userData.texture = texture
+
   return sprite
-}
-
-// ─── 初始化粒子系统 ─────────────────────────────────────────
-function initParticles() {
-  particlePositions = new Float32Array(PARTICLE_COUNT * 3)
-  particleVelocities = []
-
-  for (let i = 0; i < PARTICLE_COUNT; i++) {
-    const theta = Math.random() * TWO_PI
-    const phi = Math.random() * Math.PI
-    const r = 3 + Math.random() * 4
-
-    particlePositions[i * 3 + 0] = Math.sin(phi) * Math.cos(theta) * r
-    particlePositions[i * 3 + 1] = 12 + Math.random() * 6
-    particlePositions[i * 3 + 2] = Math.sin(phi) * Math.sin(theta) * r
-
-    particleVelocities.push({ x: 0, y: 0, z: 0 })
-  }
-
-  const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.BufferAttribute(particlePositions, 3))
-
-  // 使用第一条线路的颜色
-  const firstLineColor = subwayLines.value[0]?.colorInt || 0xff00ff
-
-  const material = new THREE.PointsMaterial({
-    size: 3,
-    color: firstLineColor,
-    transparent: true,
-    opacity: 1,
-    sizeAttenuation: true,
-    blending: THREE.AdditiveBlending,
-  })
-
-  particlePoints = new THREE.Points(geometry, material)
-  scene.add(particlePoints)
-
-  // 能量球
-  energyBall = new THREE.Mesh(
-    new THREE.SphereGeometry(6, 24, 24),
-    new THREE.MeshBasicMaterial({ color: firstLineColor, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending })
-  )
-  energyBall.position.set(0, 15, 0)
-  scene.add(energyBall)
 }
 
 // ─── 初始化列车 ─────────────────────────────────────────────
 function initTrains() {
-  const speeds = [0.00012, 0.00018]
-  const offsets = [0, 0.4]
+  const speed = 0.00012
 
   for (const lineObj of lineObjects) {
-    for (let j = 0; j < 2; j++) {
-      const train = createTrain(lineObj.mats.lineMat1.color)
-      train.visible = false
-      train.userData = { t: offsets[j], speed: speeds[j], curve: lineObj.curve, direction: 1 }
-      scene.add(train)
-      trainObjects.push(train)
+    const train = createTrain(lineObj.mats.lineMat1.color, lineObj.lineName)
+    train.visible = false
+
+    // 计算每个站在曲线上的 t 值
+    const stationTValues = []
+    const curve = lineObj.curve
+    const stations = lineObj.stations
+    const sampleCount = 500
+
+    for (let s = 0; s < stations.length; s++) {
+      const stationPos = stations[s].position
+      let minDist = Infinity
+      let bestT = s / (stations.length - 1) // 默认均匀分布
+
+      // 采样曲线找最近点
+      for (let i = 0; i <= sampleCount; i++) {
+        const t = i / sampleCount
+        const point = curve.getPointAt(t)
+        const dx = point.x - stationPos.x
+        const dz = point.z - stationPos.z
+        const dist = Math.sqrt(dx * dx + dz * dz)
+        if (dist < minDist) {
+          minDist = dist
+          bestT = t
+        }
+      }
+      stationTValues.push(bestT)
     }
+
+    train.userData = {
+      t: 0,
+      speed: speed,
+      curve: curve,
+      direction: 1,
+      lineName: lineObj.lineName,
+      waiting: false,
+      waitTimer: 0,
+      stations: stations,
+      stationTValues: stationTValues
+    }
+    scene.add(train)
+    trainObjects.push(train)
   }
 }
 
-// ─── 创建赛博朋克列车 (优化: 简化结构) ─────────────────────
-function createTrain(colorInt) {
+// ─── 加载地铁模型 ─────────────────────────────────────────
+let subwayModel = null
+
+function loadSubwayModel() {
+  return new Promise((resolve, reject) => {
+    const loader = new GLTFLoader()
+    loader.load(
+      '/models/subway.glb',
+      (gltf) => {
+        subwayModel = gltf.scene
+        resolve(subwayModel)
+      },
+      undefined,
+      (error) => {
+        console.error('Error loading subway model:', error)
+        reject(error)
+      }
+    )
+  })
+}
+
+// ─── 创建列车 (使用 GLB 模型或备用几何体) ─────────────────
+function createTrain(colorInt, lineName) {
   const group = new THREE.Group()
 
-  // 车身
-  const bodyMat = new THREE.MeshPhongMaterial({ color: 0x111111, emissive: colorInt, emissiveIntensity: 0.8 })
-  const body = new THREE.Mesh(new THREE.BoxGeometry(10, 4, 6), bodyMat)
-  group.add(body)
+  if (subwayModel) {
+    // 使用加载的 GLB 模型
+    const model = subwayModel.clone()
+    const lineColor = new THREE.Color(colorInt)
+    model.traverse((child) => {
+      if (child.isMesh) {
+        // 强制覆盖材质颜色
+        if (child.material) {
+          const mat = child.material.clone()
+          mat.color = lineColor
+          mat.emissive = lineColor
+          mat.emissiveIntensity = 0.6
+          child.material = mat
+        }
+      }
+    })
+    group.add(model)
+  } else {
+    // 备用：程序生成几何体
+    const bodyMat = new THREE.MeshPhongMaterial({ color: 0x111111, emissive: colorInt, emissiveIntensity: 0.8 })
+    const body = new THREE.Mesh(new THREE.BoxGeometry(10, 4, 6), bodyMat)
+    group.add(body)
 
-  // 霓虹灯带
-  const stripMat = new THREE.MeshBasicMaterial({ color: colorInt, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending })
-  const strip = new THREE.Mesh(new THREE.BoxGeometry(10.5, 0.5, 6.5), stripMat)
-  group.add(strip)
+    const stripMat = new THREE.MeshBasicMaterial({ color: colorInt, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending })
+    const strip = new THREE.Mesh(new THREE.BoxGeometry(10.5, 0.5, 6.5), stripMat)
+    group.add(strip)
 
-  // 头部
-  const headMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })
-  const head = new THREE.Mesh(new THREE.ConeGeometry(3, 6, 4), headMat)
-  head.rotation.x = Math.PI / 2
-  head.position.z = 4
-  group.add(head)
+    const headMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9 })
+    const head = new THREE.Mesh(new THREE.ConeGeometry(3, 6, 4), headMat)
+    head.rotation.x = Math.PI / 2
+    head.position.z = 4
+    group.add(head)
 
-  // 外发光
-  const glowMat = new THREE.MeshBasicMaterial({ color: colorInt, transparent: true, opacity: 0.1, side: THREE.BackSide, blending: THREE.AdditiveBlending })
-  const glow = new THREE.Mesh(new THREE.BoxGeometry(12, 6, 8), glowMat)
-  group.add(glow)
+    const glowMat = new THREE.MeshBasicMaterial({ color: colorInt, transparent: true, opacity: 0.1, side: THREE.BackSide, blending: THREE.AdditiveBlending })
+    const glow = new THREE.Mesh(new THREE.BoxGeometry(12, 6, 8), glowMat)
+    group.add(glow)
+  }
 
   return group
 }
@@ -346,22 +456,7 @@ function initLights() {
 
 // ─── 初始化地面 ─────────────────────────────────────────────
 function initGround() {
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(10000, 10000), new THREE.MeshBasicMaterial({ color: 0x050510 }))
-  ground.rotation.x = -Math.PI / 2
-  ground.position.y = -20
-  scene.add(ground)
-
-  const grid1 = new THREE.GridHelper(10000, 100, 0x00ffff, 0x001133)
-  grid1.position.y = -18
-  grid1.material.transparent = true
-  grid1.material.opacity = 0.3
-  scene.add(grid1)
-
-  const grid2 = new THREE.GridHelper(10000, 500, 0xff00ff, 0x050010)
-  grid2.position.y = -19
-  grid2.material.transparent = true
-  grid2.material.opacity = 0.1
-  scene.add(grid2)
+  // 已禁用：黑色地面和坐标系网格
 }
 
 // ─── 初始化星空 ─────────────────────────────────────────────
@@ -438,19 +533,12 @@ async function init() {
   initGround()
   initStarfield()
   buildSubwayLines()
+
+  // 加载地铁模型
+  await loadSubwayModel()
+
   initTrains()
-  initParticles()
   await initPostProcessing()
-
-  // 粒子凝聚动画
-  setTimeout(() => {
-    trainAssembleState.value = 'assembling'
-    assembleStartTime.value = Date.now()
-  }, 2000)
-
-  setTimeout(() => {
-    trainAssembleState.value = 'complete'
-  }, 4000)
 
   // 动画循环
   let lastTime = performance.now()
@@ -463,9 +551,9 @@ async function init() {
     const elapsed = time / 1000
 
     updateBreathing(elapsed, delta)
-    updateParticles(delta, elapsed)
     updateTrains(delta)
     updateFlyCamera(delta)
+    updateCameraFollow()
     orbitCtrl.update()
 
     composer.render()
@@ -473,6 +561,32 @@ async function init() {
 
   animate(0)
   window.addEventListener('resize', onResize)
+
+  // 欢迎文字3秒后消失
+  setTimeout(() => {
+    showWelcome.value = false
+  }, 1800)
+}
+
+// ─── 相机平移控制 ─────────────────────────────────────────
+function panCamera(direction) {
+  if (!camera || !scene) return
+  const panSpeed = bounds.size * 0.2
+
+  switch (direction) {
+    case 'up':
+      camera.position.z -= panSpeed
+      break
+    case 'down':
+      camera.position.z += panSpeed
+      break
+    case 'left':
+      camera.position.x -= panSpeed
+      break
+    case 'right':
+      camera.position.x += panSpeed
+      break
+  }
 }
 
 // ─── 呼吸动画 (优化: 减少计算) ─────────────────────────────
@@ -524,6 +638,26 @@ function updateBreathing(elapsed, delta) {
     obj.ring.rotation.z += delta * 0.8
 
     const isSelected = currentSelected === null || currentSelected === obj.lineName
+
+    // 站点闪烁效果
+    let labelOpacity = isSelected ? 0.35 : 0.15 // 默认低亮度
+    let labelScale = 1
+
+    if (obj.isActive) {
+      // 到站闪烁：透明度在0.3和1.0之间闪烁，scale在1到1.5之间变化
+      const flashSpeed = 8
+      const flash = Math.sin(elapsed * flashSpeed)
+      labelOpacity = 0.5 + flash * 0.5
+      labelScale = 1.2 + flash * 0.3
+    }
+
+    // 更新标签
+    if (obj.label.userData.drawLabel) {
+      obj.label.userData.drawLabel(labelOpacity, labelScale)
+      obj.label.userData.texture.needsUpdate = true
+    }
+    obj.label.scale.set(120 * labelScale, 30 * labelScale, 1)
+
     const baseBreathOpacity = isSelected ? 0.6 + adjBreath * 0.4 : 0.2 + adjBreath * 0.1
 
     obj.mats.glowMat.opacity = isSelected ? 0.08 * baseBreathOpacity : 0
@@ -531,7 +665,6 @@ function updateBreathing(elapsed, delta) {
     obj.mats.ring2Mat.opacity = isSelected ? 0.4 * (0.6 + adjBreath * 0.4) : 0
     obj.core.material.opacity = isSelected ? 1 : 0
     obj.mats.innerMat.opacity = isSelected ? 0.9 : 0
-    obj.label.material.opacity = isSelected ? 0.9 : 0
   }
 
   // Bloom 呼吸
@@ -540,80 +673,154 @@ function updateBreathing(elapsed, delta) {
   }
 }
 
-// ─── 粒子更新 (优化: 减少对象创建) ───────────────────────────
-function updateParticles(delta, elapsed) {
-  if (!particlePoints) return
 
-  const state = trainAssembleState.value
 
-  if (state === 'particles') {
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-      const angle = elapsed * 0.5 + i * 0.01
-      particlePositions[i * 3 + 0] += Math.sin(angle) * 0.02
-      particlePositions[i * 3 + 1] += 0.01
-      particlePositions[i * 3 + 2] += Math.cos(angle) * 0.02
-    }
-
-    if (energyBall) {
-      const pulse = 1 + Math.sin(elapsed * 4) * 0.15
-      energyBall.scale.setScalar(pulse)
-      energyBall.rotation.y = elapsed * 0.5
-    }
-  } else if (state === 'assembling' && assembleStartTime.value) {
-    const progress = Math.min((Date.now() - assembleStartTime.value) / 2000, 1)
-    const ease = progress * progress * progress
-
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-      particlePositions[i * 3 + 0] *= (1 - ease * 0.1)
-      particlePositions[i * 3 + 1] += (8 - particlePositions[i * 3 + 1]) * ease * 0.08
-      particlePositions[i * 3 + 2] *= (1 - ease * 0.1)
-    }
-
-    if (energyBall) {
-      const scale = Math.max(0, 1 - progress * 1.2)
-      energyBall.scale.setScalar(scale)
-      if (scale <= 0) {
-        scene.remove(energyBall)
-        energyBall = null
-      }
-    }
-
-    if (progress > 0.7) {
-      for (const train of trainObjects) {
-        train.visible = true
-      }
-    }
-  }
-
-  particlePoints.geometry.attributes.position.needsUpdate = true
-
-  if (state === 'complete' && particlePoints) {
-    scene.remove(particlePoints)
-    particlePoints = null
-  }
-}
-
-// ─── 列车更新 (优化: 缓存计算) ───────────────────────────────
+// ─── 列车更新 ───────────────────────────────
 const tempPos = new THREE.Vector3()
 const tempLookAt = new THREE.Vector3()
+const STATION_STOP_TIME = 3000 // 3秒停站
 
 function updateTrains(delta) {
-  if (trainAssembleState.value !== 'complete') return
-
   for (const train of trainObjects) {
     const ud = train.userData
-    ud.t += ud.speed * delta * 60 * ud.direction
+
+    // 非选中线路的小车不更新
+    if (selectedLine.value && ud.lineName !== selectedLine.value) continue
+
+    // 停站逻辑
+    if (ud.waiting) {
+      ud.waitTimer += delta * 1000
+      if (ud.waitTimer >= STATION_STOP_TIME) {
+        ud.waiting = false
+        ud.waitTimer = 0
+      }
+
+      // 更新位置但保持原地
+      tempPos.copy(ud.curve.getPointAt(ud.t))
+      tempPos.y = 2
+      train.position.copy(tempPos)
+
+      tempLookAt.copy(ud.curve.getPointAt(Math.min(ud.t + 0.008, 0.999)))
+      tempLookAt.y = 2
+      train.lookAt(tempLookAt)
+      continue
+    }
+
+    // 保存上一次的 t 值
+    const prevT = ud.t
+
+    // 基础速度
+    const baseSpeed = ud.speed
+
+    // 计算当前段和段内进度
+    const stationCount = ud.stationTValues?.length || 2
+    const segmentLength = 1 / (stationCount - 1)
+    const currentSegment = Math.floor(ud.t / segmentLength)
+    const segmentStart = currentSegment * segmentLength
+    const tInSegment = (ud.t - segmentStart) / segmentLength
+
+    // 贝塞尔缓动：每段开始加速，结束前减速
+    let speedFactor = 1
+    if (tInSegment < 0.2) {
+      // 开始20%：缓入
+      const t = tInSegment / 0.2
+      speedFactor = t * t * (3 - 2 * t) * 0.6 + 0.4
+    } else if (tInSegment > 0.8) {
+      // 结束20%：缓出
+      const t = (1 - tInSegment) / 0.2
+      speedFactor = t * t * (3 - 2 * t) * 0.6 + 0.4
+    } else {
+      // 中间60%：全速
+      speedFactor = 1
+    }
+
+    // 移动
+    const dynamicSpeed = baseSpeed * speedFactor
+    ud.t += dynamicSpeed * delta * 60 * ud.direction
     if (ud.t > 1) ud.t = 0
     if (ud.t < 0) ud.t = 1
 
+    // 检测是否到达站点
+    if (ud.stationTValues && ud.stationTValues.length > 0) {
+      for (let i = 0; i < ud.stationTValues.length; i++) {
+        const stationT = ud.stationTValues[i]
+        if (ud.direction > 0) {
+          if (prevT < stationT && ud.t >= stationT) {
+            ud.t = stationT
+            ud.waiting = true
+            ud.waitTimer = 0
+            // 清除所有站点活跃状态，再标记当前站点
+            clearLineStationsActive(ud.lineName)
+            markStationActive(ud.lineName, i, true)
+            break
+          }
+        } else {
+          if (prevT > stationT && ud.t <= stationT) {
+            ud.t = stationT
+            ud.waiting = true
+            ud.waitTimer = 0
+            // 清除所有站点活跃状态，再标记当前站点
+            clearLineStationsActive(ud.lineName)
+            markStationActive(ud.lineName, i, true)
+            break
+          }
+        }
+      }
+
+      // 如果正在移动且不靠近任何站点，清除所有活跃状态
+      if (!ud.waiting) {
+        clearLineStationsActive(ud.lineName)
+      }
+    }
+
     tempPos.copy(ud.curve.getPointAt(ud.t))
-    tempPos.y = 8
+    tempPos.y = 2
     train.position.copy(tempPos)
 
     tempLookAt.copy(ud.curve.getPointAt(Math.min(ud.t + 0.008, 0.999)))
-    tempLookAt.y = 8
+    tempLookAt.y = 2
     train.lookAt(tempLookAt)
   }
+}
+
+// ─── 标记站点活跃状态 ───────────────────────────────
+function markStationActive(lineName, stationIndex, isActive) {
+  for (const stationObj of stationObjects) {
+    if (stationObj.lineName === lineName && stationObj.stationIndex === stationIndex) {
+      stationObj.isActive = isActive
+    }
+  }
+}
+
+// ─── 清除线路所有站点活跃状态 ───────────────────────────────
+function clearLineStationsActive(lineName) {
+  for (const stationObj of stationObjects) {
+    if (stationObj.lineName === lineName) {
+      stationObj.isActive = false
+    }
+  }
+}
+
+// ─── 更新相机跟随 ─────────────────────────────────────────
+function updateCameraFollow() {
+  if (!followingTrain.value || !selectedLine.value) return
+
+  const train = trainObjects.find(t => t.userData.lineName === selectedLine.value)
+  if (!train) return
+
+  const trainPos = train.position
+  const trainRotation = train.rotation.y
+  const offsetDist = bounds.size * 0.1
+
+  // 禁用轨道控制以保持跟随
+  orbitCtrl.enabled = false
+
+  // 相机目标位置：在小车左侧方，同样高度
+  const cameraX = trainPos.x - Math.cos(trainRotation) * offsetDist
+  const cameraZ = trainPos.z + Math.sin(trainRotation) * offsetDist
+
+  orbitCtrl.target.copy(trainPos)
+  camera.position.set(cameraX, 100, cameraZ)
 }
 
 // ─── 窗口调整 ───────────────────────────────────────────────
@@ -662,16 +869,6 @@ function dispose() {
       if (child.geometry) child.geometry.dispose()
       if (child.material) child.material.dispose()
     })
-  }
-
-  // 清理粒子
-  if (particlePoints) {
-    particlePoints.geometry.dispose()
-    particlePoints.material.dispose()
-  }
-  if (energyBall) {
-    energyBall.geometry.dispose()
-    energyBall.material.dispose()
   }
 
   if (composer) composer.dispose()
@@ -731,17 +928,32 @@ const trainCount = ref(0)
       </div>
     </div>
 
+    <!-- 方向控制 -->
+    <div class="direction-controls" :class="{ 'controls-visible': !selectedLine }">
+      <div class="dir-btn-wrapper">
+        <button class="dir-btn dir-up" @click="panCamera('up')">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 4l-8 8h5v8h6v-8h5z"/></svg>
+        </button>
+        <button class="dir-btn dir-left" @click="panCamera('left')">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 12l8-8v5h8v6h-8v5z"/></svg>
+        </button>
+        <button class="dir-btn dir-down" @click="panCamera('down')">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20l8-8h-5v-8h-6v8h-5z"/></svg>
+        </button>
+        <button class="dir-btn dir-right" @click="panCamera('right')">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20 12l-8 8v-5h-8v-6h8v-5z"/></svg>
+        </button>
+      </div>
+      <div class="dir-hint">平移视角</div>
+    </div>
+
     <div class="scanlines"></div>
     <div class="corner corner-tl"></div>
     <div class="corner corner-tr"></div>
     <div class="corner corner-bl"></div>
     <div class="corner corner-br"></div>
 
-    <div v-if="trainAssembleState !== 'complete'" class="assembly-status">
-      <div class="assembly-text">
-        {{ trainAssembleState === 'particles' ? '能量汇聚中...' : '// 粒子凝聚 //' }}
-      </div>
-    </div>
+    <div v-if="showWelcome" class="welcome-text">欢迎来到杭州</div>
   </div>
 </template>
 
@@ -940,7 +1152,7 @@ const trainCount = ref(0)
 .corner-bl { bottom: 70px; left: 16px; border-bottom: 2px solid #ff00ff; border-left: 2px solid #ff00ff; }
 .corner-br { bottom: 70px; right: 16px; border-bottom: 2px solid #00ffff; border-right: 2px solid #00ffff; }
 
-.assembly-status {
+.welcome-text {
   position: absolute;
   top: 50%;
   left: 50%;
@@ -948,24 +1160,27 @@ const trainCount = ref(0)
   z-index: 10;
   pointer-events: none;
   text-align: center;
-}
-
-.assembly-text {
-  font-size: 28px;
+  font-size: 48px;
   font-weight: 700;
-  letter-spacing: 8px;
-  color: #ff00ff;
-  text-shadow: 0 0 30px #ff00ff, 0 0 60px rgba(255, 0, 255, 0.7);
-  font-family: 'Courier New', monospace;
-  animation: glitch 0.3s ease-in-out infinite;
+  letter-spacing: 12px;
+  color: #00ffff;
+  text-shadow: 0 0 30px #00ffff, 0 0 60px rgba(0, 255, 255, 0.7);
+  font-family: "Courier New", monospace;
+  animation: welcomeGlitch 0.15s ease-in-out infinite, welcomeGlow 2s ease-in-out infinite;
 }
 
-@keyframes glitch {
-  0%, 100% { transform: translate(0); }
-  20% { transform: translate(-2px, 1px); }
-  40% { transform: translate(2px, -1px); }
-  60% { transform: translate(-1px, -1px); }
-  80% { transform: translate(1px, 1px); }
+@keyframes welcomeGlitch {
+  0% { transform: translate(-50%, -50%); }
+  20% { transform: translate(-52%, -48%); }
+  40% { transform: translate(-48%, -52%); }
+  60% { transform: translate(-51%, -49%); }
+  80% { transform: translate(-49%, -51%); }
+  100% { transform: translate(-50%, -50%); }
+}
+
+@keyframes welcomeGlow {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; text-shadow: 0 0 40px #00ffff, 0 0 80px rgba(0, 255, 255, 0.9), -2px 0 #ff00ff, 2px 0 #00ffff; }
 }
 
 /* 移动端适配 */
@@ -1061,6 +1276,120 @@ const trainCount = ref(0)
   .corner {
     width: 24px;
     height: 24px;
+  }
+}
+
+/* 方向控制按钮 */
+.direction-controls {
+  position: absolute;
+  bottom: 90px;
+  left: 24px;
+  z-index: 10;
+  opacity: 0;
+  transform: translateY(20px);
+  transition: all 0.3s ease;
+  pointer-events: none;
+}
+
+.direction-controls.controls-visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.dir-btn-wrapper {
+  display: grid;
+  grid-template-columns: repeat(3, 44px);
+  grid-template-rows: repeat(2, 44px);
+  gap: 4px;
+}
+
+.dir-btn {
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(0, 255, 255, 0.4);
+  background: rgba(5, 5, 16, 0.85);
+  border-radius: 8px;
+  color: #00ffff;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+  backdrop-filter: blur(10px);
+  touch-action: manipulation;
+}
+
+.dir-btn svg {
+  width: 20px;
+  height: 20px;
+}
+
+.dir-btn:active:not(:disabled),
+.dir-btn.active:not(:disabled) {
+  background: rgba(0, 255, 255, 0.2);
+  border-color: #00ffff;
+  box-shadow: 0 0 15px rgba(0, 255, 255, 0.4);
+  transform: scale(0.95);
+}
+
+.dir-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.dir-up { grid-column: 2; grid-row: 1; }
+.dir-left { grid-column: 1; grid-row: 2; }
+.dir-down { grid-column: 2; grid-row: 2; }
+.dir-right { grid-column: 3; grid-row: 2; }
+
+.dir-hint {
+  font-size: 10px;
+  color: rgba(255, 255, 255, 0.4);
+  text-align: center;
+  margin-top: 8px;
+  letter-spacing: 2px;
+  font-family: 'Courier New', monospace;
+}
+
+/* 移动端适配 - 方向按钮 */
+@media (max-width: 768px) {
+  .direction-controls {
+    bottom: 100px;
+    left: 16px;
+  }
+
+  .dir-btn-wrapper {
+    grid-template-columns: repeat(3, 52px);
+    grid-template-rows: repeat(2, 52px);
+    gap: 6px;
+  }
+
+  .dir-btn {
+    width: 52px;
+    height: 52px;
+    border-radius: 12px;
+  }
+
+  .dir-btn svg {
+    width: 24px;
+    height: 24px;
+  }
+
+  .dir-hint {
+    font-size: 9px;
+  }
+}
+
+@media (max-width: 480px) {
+  .dir-btn-wrapper {
+    grid-template-columns: repeat(3, 48px);
+    grid-template-rows: repeat(2, 48px);
+  }
+
+  .dir-btn {
+    width: 48px;
+    height: 48px;
   }
 }
 </style>
