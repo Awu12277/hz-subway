@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(npx openspec:*)",
+      "Bash(openspec list:*)",
+      "mcp__context7__resolve-library-id",
+      "mcp__context7__query-docs",
+      "Bash(curl -s http://localhost:5173/src/components/SubwayScene.vue)",
+      "mcp__ide__getDiagnostics",
+      "Bash(node:*)",
+      "Bash(curl -s http://localhost:5173)"
+    ]
+  }
+}

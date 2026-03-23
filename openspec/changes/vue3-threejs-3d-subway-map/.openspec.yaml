@@ -1,0 +1,12 @@
+name: vue3-threejs-3d-subway-map
+status: drafted
+artifacts:
+  - id: proposal
+    status: done
+  - id: design
+    status: done
+  - id: specs
+    status: done
+  - id: tasks
+    status: done
+createdAt: 2026-03-23T00:00:00.000Z
